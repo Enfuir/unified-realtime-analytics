@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aurora RealTime Analytics</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:       #0a0e1a;
+      --surface:  #111827;
+      --border:   #1f2937;
+      --accent:   #60a5fa;
+      --green:    #34d399;
+      --red:      #f87171;
+      --yellow:   #fbbf24;
+      --cyan:     #22d3ee;
+      --text:     #e5e7eb;
+      --muted:    #6b7280;
+      --font:     'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .logo {
+      font-size: 1.4em;
+      font-weight: bold;
+      color: var(--accent);
+      letter-spacing: 2px;
+    }
+    .logo span { color: var(--cyan); }
+    .status-bar { display: flex; gap: 16px; align-items: center; }
+    .status-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s infinite;
+    }
+    .status-dot.offline { background: var(--red); animation: none; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .status-text { font-size: 0.85em; color: var(--muted); }
+
+    /* ── Layout ── */
+    .container { max-width: 1400px; margin: 0 auto; padding: 20px 24px; }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 0.85em;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-title::before {
+      content: '';
+      width: 3px; height: 14px;
+      background: var(--accent);
+      border-radius: 2px;
+    }
+    .card-title.red::before   { background: var(--red); }
+    .card-title.yellow::before { background: var(--yellow); }
+    .card-title.cyan::before   { background: var(--cyan); }
+    .card-title.green::before  { background: var(--green); }
+
+    /* ── Metrics grid ── */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .metric {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      text-align: center;
+    }
+    .metric-value { font-size: 2em; font-weight: bold; color: var(--accent); }
+    .metric-label { font-size: 0.75em; color: var(--muted); margin-top: 4px; }
+    .metric-card.syscalls .metric-value { color: var(--yellow); }
+    .metric-card.memory   .metric-value { color: var(--cyan); }
+    .metric-card.antidebug .metric-value { color: var(--red); }
+
+    /* ── Section tabs ── */
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    .tab {
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85em;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      transition: all 0.2s;
+    }
+    .tab.active, .tab:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+    /* ── Tables ── */
+    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+    th { color: var(--muted); text-align: left; padding: 8px 12px;
+         border-bottom: 1px solid var(--border); }
+    td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+    tr:hover td { background: rgba(255,255,255,0.03); }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-size: 0.8em; font-weight: bold;
+    }
+    .badge-detected  { background: rgba(248,113,113,0.15); color: var(--red); }
+    .badge-clean      { background: rgba(52,211,153,0.15);  color: var(--green); }
+    .badge-warning    { background: rgba(251,191,36,0.15);  color: var(--yellow); }
+
+    /* ── Charts ── */
+    .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+    .chart-wrap  { height: 250px; position: relative; }
+    .chart-wrap canvas { width: 100% !important; height: 100% !important; }
+
+    /* ── Log / events ── */
+    .event-log { max-height: 300px; overflow-y: auto; }
+    .event-item {
+      display: flex; gap: 12px; padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8em;
+    }
+    .event-source {
+      font-weight: bold; min-width: 80px;
+    }
+    .event-source.syscall   { color: var(--yellow); }
+    .event-source.memory   { color: var(--cyan); }
+    .event-source.antidebug { color: var(--red); }
+    .event-time { color: var(--muted); min-width: 80px; }
+    .event-body { color: var(--text); flex: 1; }
+
+    /* ── Refresh button ── */
+    .refresh-btn {
+      background: var(--accent); color: #fff; border: none;
+      padding: 8px 20px; border-radius: 6px;
+      cursor: pointer; font-family: inherit; font-size: 0.85em;
+      transition: opacity 0.2s;
+    }
+    .refresh-btn:hover { opacity: 0.85; }
+
+    /* ── Scan button ── */
+    .scan-btn {
+      background: var(--cyan); color: #000; border: none;
+      padding: 8px 16px; border-radius: 6px;
+      cursor: pointer; font-family: inherit; font-size: 0.8em; font-weight: bold;
+    }
+
+    @media (max-width: 900px) {
+      .charts-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">AURORA <span>UNIFIED ANALYTICS</span></div>
+  <div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-text" id="statusText">LIVE</span>
+    <button class="refresh-btn" onclick="loadAll()">Refresh</button>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- ── Metrics ── -->
+  <div class="metrics-grid">
+    <div class="metric">
+      <div class="metric-value" id="mTotal">0</div>
+      <div class="metric-label">Total Events</div>
+    </div>
+    <div class="metric metric-card syscalls">
+      <div class="metric-value" id="mSyscalls">0</div>
+      <div class="metric-label">Syscalls</div>
+    </div>
+    <div class="metric metric-card memory">
+      <div class="metric-value" id="mRegions">0</div>
+      <div class="metric-label">Regions Scanned</div>
+    </div>
+    <div class="metric metric-card antidebug">
+      <div class="metric-value" id="mAntiDbg">—</div>
+      <div class="metric-label">Anti-Debug</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" id="mMatches">0</div>
+      <div class="metric-label">Pattern Matches</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" id="mUptime">0s</div>
+      <div class="metric-label">Uptime</div>
+    </div>
+  </div>
+
+  <!-- ── Charts ── -->
+  <div class="charts-grid">
+    <div class="card">
+      <div class="card-title yellow">Syscall Frequency</div>
+      <div class="chart-wrap"><canvas id="syscallChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title cyan">Memory Scan Regions</div>
+      <div class="chart-wrap"><canvas id="memoryChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- ── Tabs ── -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('syscalls')">Syscalls</div>
+    <div class="tab" onclick="switchTab('memory')">Memory Scanner</div>
+    <div class="tab" onclick="switchTab('antidebug')">Anti-Debug</div>
+    <div class="tab" onclick="switchTab('events')">Event Log</div>
+  </div>
+
+  <!-- ── Tab: Syscalls ── -->
+  <div id="tab-syscalls" class="card">
+    <div class="card-title yellow">Syscall SSN Table</div>
+    <div style="overflow-x:auto;">
+      <table id="ssnTable">
+        <thead><tr><th>Name</th><th>SSN (hex)</th><th>Calls</th><th>Avg (μs)</th><th>Errors</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Tab: Memory ── -->
+  <div id="tab-memory" class="card" style="display:none">
+    <div class="card-title cyan">
+      Offset Database
+      <button class="scan-btn" onclick="triggerScan()">Scan Now</button>
+    </div>
+    <div style="overflow-x:auto;">
+      <table id="offsetTable">
+        <thead><tr><th>Signature</th><th>Module</th><th>Offset</th><th>Pointer</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div style="margin-top:12px;font-size:0.8em;color:var(--muted)" id="scanStats"></div>
+  </div>
+
+  <!-- ── Tab: Anti-Debug ── -->
+  <div id="tab-antidebug" class="card" style="display:none">
+    <div class="card-title red">Debugger & VM Detection</div>
+    <table id="adTable">
+      <thead><tr><th>Method</th><th>Status</th><th>Value</th><th>Detail</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- ── Tab: Events ── -->
+  <div id="tab-events" class="card" style="display:none">
+    <div class="card-title green">Live Event Stream</div>
+    <div class="event-log" id="eventLog"></div>
+  </div>
+
+</div>
+
+<script>
+  let data = {};
+  let charts = {};
+  let startTime = Date.now();
+  let eventLog = [];
+
+  // ── Data loading ────────────────────────────────────────────────────────────
+  async function loadAll() {
+    try {
+      const r = await fetch('/api/dashboard');
+      data = await r.json();
+      updateMetrics();
+      updateSyscallChart();
+      updateMemoryChart();
+      updateTables();
+      document.getElementById('statusDot').classList.remove('offline');
+      document.getElementById('statusText').textContent = 'LIVE';
+    } catch(e) {
+      document.getElementById('statusDot').classList.add('offline');
+      document.getElementById('statusText').textContent = 'OFFLINE';
+    }
+  }
+
+  function updateMetrics() {
+    const m = data.metrics || {};
+    const sc = data.syscalls || {};
+    const mem = data.memory || {};
+    const ad = data.antidebug || {};
+
+    document.getElementById('mTotal').textContent = m.total_events || 0;
+    document.getElementById('mSyscalls').textContent =
+      (sc.total_calls || 0).toLocaleString();
+    document.getElementById('mRegions').textContent =
+      mem.regions_scanned || 0;
+    document.getElementById('mMatches').textContent =
+      mem.matches_found || 0;
+
+    const adStatus = ad.status || {};
+    const adEl = document.getElementById('mAntiDbg');
+    if (adStatus.detected) {
+      adEl.textContent = adStatus.count || '!';
+      adEl.style.color = 'var(--red)';
+    } else {
+      adEl.textContent = 'CLEAN';
+      adEl.style.color = 'var(--green)';
+    }
+
+    const uptime = Math.floor((Date.now() - startTime) / 1000);
+    document.getElementById('mUptime').textContent = fmtUptime(uptime);
+  }
+
+  function fmtUptime(s) {
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm';
+    return Math.floor(s/3600) + 'h';
+  }
+
+  // ── Charts ──────────────────────────────────────────────────────────────────
+  function updateSyscallChart() {
+    const sc = data.syscalls || {};
+    const top = (sc.top_syscalls || []).slice(0, 12);
+    const labels = top.map(x => x.name);
+    const counts = top.map(x => x.count);
+
+    if (charts.syscall) {
+      charts.syscall.data.labels = labels;
+      charts.syscall.data.datasets[0].data = counts;
+      charts.syscall.update();
+    } else {
+      const ctx = document.getElementById('syscallChart').getContext('2d');
+      charts.syscall = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Calls',
+            data: counts,
+            backgroundColor: 'rgba(251,191,36,0.6)',
+            borderColor: 'rgba(251,191,36,1)',
+            borderWidth: 1,
+          }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#6b7280', font: { size: 9 } },
+                 grid: { color: 'rgba(255,255,255,0.05)' } },
+            y: { ticks: { color: '#6b7280' },
+                 grid: { color: 'rgba(255,255,255,0.05)' } }
+          }
+        }
+      });
+    }
+  }
+
+  function updateMemoryChart() {
+    const mem = data.memory || {};
+    const db  = mem.offset_db || {};
+    const labels = Object.keys(db);
+    const counts = labels.map(k => db[k].count || 0);
+
+    if (charts.memory) {
+      charts.memory.data.labels = labels;
+      charts.memory.data.datasets[0].data = counts;
+      charts.memory.update();
+    } else {
+      const ctx = document.getElementById('memoryChart').getContext('2d');
+      charts.memory = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels,
+          datasets: [{
+            data: counts,
+            backgroundColor: [
+              'rgba(34,211,238,0.7)','rgba(96,165,250,0.7)',
+              'rgba(167,139,250,0.7)','rgba(52,211,153,0.7)',
+              'rgba(251,191,36,0.7)','rgba(248,113,113,0.7)',
+            ],
+            borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)',
+          }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { position: 'right', labels: { color: '#e5e7eb', font: { size: 10 } } } }
+        }
+      });
+    }
+  }
+
+  // ── Tables ───────────────────────────────────────────────────────────────────
+  function updateTables() {
+    updateSSNTable();
+    updateOffsetTable();
+    updateADTable();
+  }
+
+  function updateSSNTable() {
+    const sc = data.syscalls || {};
+    const top = (sc.top_syscalls || []).slice(0, 50);
+    const tbody = document.querySelector('#ssnTable tbody');
+    tbody.innerHTML = top.map(x => `
+      <tr>
+        <td>${x.name}</td>
+        <td style="color:var(--yellow)">${x.ssn}</td>
+        <td>${x.count.toLocaleString()}</td>
+        <td>${x.avg_us.toFixed(2)}</td>
+        <td>${x.errors > 0 ? `<span class="badge badge-detected">${x.errors}</span>` : '0'}</td>
+      </tr>
+    `).join('');
+  }
+
+  function updateOffsetTable() {
+    const mem = data.memory || {};
+    const db  = mem.offset_db || {};
+    const tbody = document.querySelector('#offsetTable tbody');
+    const rows = [];
+    for (const [sig, info] of Object.entries(db)) {
+      for (const [off, meta] of Object.entries(info.offsets || {})) {
+        rows.push(`<tr>
+          <td>${sig}</td>
+          <td>${meta.module}</td>
+          <td>${off}</td>
+          <td>${meta.pointer || '—'}</td>
+        </tr>`);
+      }
+    }
+    tbody.innerHTML = rows.join('') || '<tr><td colspan="4" style="color:var(--muted)">No patterns matched. Click Scan Now.</td></tr>';
+    document.getElementById('scanStats').textContent =
+      `Scanned ${mem.regions_scanned || 0} regions, ${mem.bytes_scanned || 0} bytes, ${mem.scan_time_ms || 0}ms`;
+  }
+
+  function updateADTable() {
+    const ad = data.antidebug || {};
+    const results = ad.all_results || [];
+    const tbody = document.querySelector('#adTable tbody');
+    tbody.innerHTML = results.map(r => `
+      <tr>
+        <td>${r.method}</td>
+        <td>${r.detected
+          ? '<span class="badge badge-detected">DETECTED</span>'
+          : '<span class="badge badge-clean">CLEAN</span>'}</td>
+        <td style="font-size:0.8em;color:var(--muted)">${JSON.stringify(r.value)}</td>
+        <td style="font-size:0.8em;color:var(--muted)">${r.detail}</td>
+      </tr>
+    `).join('');
+  }
+
+  // ── Tabs ────────────────────────────────────────────────────────────────────
+  function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    event.currentTarget?.classList.add('active') ||
+      [...document.querySelectorAll('.tab')].find(t => t.textContent.toLowerCase().includes(name))?.classList.add('active');
+    ['syscalls','memory','antidebug','events'].forEach(id => {
+      document.getElementById('tab-' + id).style.display = id === name ? 'block' : 'none';
+    });
+  }
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
+  async function triggerScan() {
+    const btn = document.querySelector('.scan-btn');
+    btn.textContent = 'Scanning...'; btn.disabled = true;
+    await fetch('/api/memory/scan', {method:'POST'});
+    await loadAll();
+    btn.textContent = 'Scan Now'; btn.disabled = false;
+  }
+
+  // ── Init ─────────────────────────────────────────────────────────────────────
+  loadAll();
+  setInterval(loadAll, 2000);
+</script>
+
+</body>
+</html>
