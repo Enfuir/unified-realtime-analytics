@@ -12,6 +12,7 @@ Serves the dashboard UI and exposes REST API endpoints for:
 from flask import Flask, jsonify, send_file, Response
 from flask_cors import CORS
 import threading, time, sys, os
+from pathlib import Path
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -72,9 +73,12 @@ def _collect_loop(interval: float = 0.5):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+def _web_root():
+    return Path(__file__).parent / "web"
+
 @app.route("/")
 def index():
-    return send_file("../web/index.html")
+    return send_file(_web_root() / "index.html")
 
 
 @app.route("/api/dashboard")
