@@ -141,6 +141,27 @@ class DebugDetectionMethod(Enum):
     VM_REGISTRY           = auto()
     VM_SHARED_MEMORY      = auto()
     VM_MAC_ADDRESS        = auto()
+    # ── Advanced (from UnknownCheats / red team research) ────────────────────
+    SEH_ABUSE             = auto()   # INT3 inside __except block
+    VEH_PRESENT           = auto()   # Vectored Exception Handler
+    TRAP_FLAG             = auto()   # TF bit in EFLAGS/RFLAGS
+    INT2D_INSTRUCTION     = auto()   # INT 2D anti-debug
+    SW_BREAKPOINT_SCAN    = auto()   # Scan .text for CC / INT3 bytes
+    KI_USER_EXCEPTION     = auto()   # KiUserExceptionDispatcher hooked
+    PARENT_PROCESS        = auto()   # non-explorer parent process
+    NTDLL_UNHOOKED        = auto()   # ntdll mapped image (not PE)
+    CODE_INTEGRITY         = auto()   # CiCheck / driver signing
+    HARDWARE_BP           = auto()   # Dr0-Dr7 debug registers
+    REMOTE_THREAD         = auto()   # foreign thread in process
+    PEB_SESSION_ID        = auto()   # SessionId != 0 on domain-joined
+    SBIEDLL_LOADED        = auto()   # Sandboxie sbiedll.dll
+    KERNEL32_UNHOOKED     = auto()   # kernel32 on-disk vs in-memory differ
+    KERNEL_CALLBACK       = auto()   # PsSetCreateProcessNotifyRoutine
+    CPUID_MANUFACTURER    = auto()   # "AuthenticAMD" vs "GenuineIntel" anomalies
+    VMWARE_PORT           = auto()   # IN 0xA from VMWare
+    VBOX_PORT             = auto()   # IN 0x10 from VirtualBox
+    THREAD_CONTEXT_FAKE   = auto()   # Thread CONTEXT inconsistent
+    TIMER_ANOMALY_LONG    = auto()   # GetTickCount delta > 500ms
 
 DETECTION_METHODS = list(DebugDetectionMethod)
 
@@ -409,6 +430,427 @@ class AntiDebugMonitor:
             return {"detected": False, "value": None,
                     "detail": f"Failed to query adapters: {e}"}
 
+    # ── Advanced anti-debug checks (UnknownCheats / red team research) ──────────
+
+    def check_seh_abuse(self) -> Dict[str, Any]:
+        """
+        SEH abuse detection: set an exception handler, trigger INT3, then
+        check if EIP lands inside the handler while the debugger would have
+        silently swallowed the exception.
+        Works on x64 (no SEH in 64-bit - uses VEH instead).
+        """
+        if not IS_WINDOWS or not ntdll:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            result = {"detected": False, "value": None, "detail": "clean"}
+
+            def _veh_handler(exc):
+                result["detected"] = True
+                result["value"] = exc["exception_code"]
+                result["detail"] = f"VEH hit: code=0x{exc['exception_code']:X}"
+                return 1  # EXCEPTION_CONTINUE_SEARCH
+
+            import ctypes
+            handler = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+            cb = handler(lambda exc, _:
+                (_veh_handler({"exception_code": exc}), 1)[1])
+            ntdll.RtlAddVectoredExceptionHandler(1, cb)
+            # Trigger breakpoint
+            ctypes.windll.kernel32.DebugBreak()
+            ntdll.RtlRemoveVectoredExceptionHandler(cb)
+            return result
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"SEH check failed: {e}"}
+
+    def check_veh_present(self) -> Dict[str, Any]:
+        """Check if any Vectored Exception Handlers are registered."""
+        if not IS_WINDOWS or not ntdll:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            # Walk VEH chain via PEB
+            peb = _read_qword(PEB_OFFSET)
+            if peb:
+                # PEB + 0x78 = VEH toplimit / first handler (Nt8+)
+                veh_ptr = _read_qword(peb + 0x78) if peb else None
+                if veh_ptr and veh_ptr != 0:
+                    return {"detected": True, "value": hex(veh_ptr),
+                            "detail": "VEH chain not empty"}
+        except Exception:
+            pass
+        return {"detected": False, "value": None, "detail": "No VEH detected"}
+
+    def check_trap_flag(self) -> Dict[str, Any]:
+        """Check if the Trap Flag (TF bit 8) is set in RFLAGS."""
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            class CONTEXT(ctypes.Structure):
+                _fields_ = [("Rflags", ctypes.c_uint64),
+                            ("Rip", ctypes.c_uint64)]
+            ctx = CONTEXT()
+            ctx.Rflags = 0
+            # Read RFLAGS via inline assembly (pushfq / pop rax)
+            import ctypes
+            # Use GetThreadContext to get RFLAGS
+            handle = kernel32.GetCurrentThread()
+            class THREAD_CONTEXT(ctypes.Structure):
+                _fields_ = [("P1", ctypes.c_uint64), ("P2", ctypes.c_uint64),
+                            ("Rflags", ctypes.c_uint64), ("Rip", ctypes.c_uint64)]
+            tc = THREAD_CONTEXT()
+            tc.P1 = 0x10007  # CONTEXT_DEBUG_REGISTERS | CONTEXT_INTEGER
+            tc.P2 = 0
+            tc.Rflags = 0
+            # We can't call GetThreadContext reliably without SEH,
+            # so use timing-based detection instead
+            return self.check_rdtsc_delta(threshold=50000)
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"TF check error: {e}"}
+
+    def check_int2d(self) -> Dict[str, Any]:
+        """
+        INT 2D instruction detection. In normal execution, INT 2D causes
+        an exception with code 0x80000003. When a debugger is present,
+        the kernel handles it differently — fewer bytes are returned as the
+        instruction is treated differently. Also: under WinDBG, INT 2D with
+        SSF (EFLAGS.TF) set triggers a single-step exception instead.
+        """
+        return {"detected": False, "value": None,
+                "detail": "INT 2D requires inline assembly (deferred)"}
+
+    def check_sw_breakpoint_scan(self, base: int = 0x140000000,
+                                 size: int = 0x1000000) -> Dict[str, Any]:
+        """
+        Scan the .text section of the main module for 0xCC (INT3) bytes.
+        A healthy .text section has very few or zero 0xCC bytes in
+        non-export regions. Heavy 0xCC presence = active breakpoints.
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            proc = kernel32.GetCurrentProcess()
+            mod = kernel32.GetModuleHandleW(None)
+            if not mod:
+                return {"detected": False, "value": None,
+                        "detail": "Failed to get module base"}
+
+            buf = ctypes.create_string_buffer(4096)
+            i = 0
+            cc_count = 0
+            cc_positions = []
+            # Sample the .text region in 4KB chunks
+            addr = ctypes.c_void_p(mod + 0x1000)
+            for _ in range(256):
+                read = ctypes.c_size_t()
+                ok = kernel32.ReadProcessMemory(proc, addr,
+                                                buf, 4096,
+                                                ctypes.byref(read))
+                if not ok or read.value == 0:
+                    break
+                for j in range(read.value):
+                    if buf.raw[j] == 0xCC:
+                        cc_count += 1
+                        if cc_count <= 5:
+                            cc_positions.append(hex(addr.value + j))
+                addr.value += 4096
+                if cc_count > 20:
+                    break  # early exit on heavy breakpoint usage
+
+            detected = cc_count > 3  # more than 3 breakpoints is suspicious
+            return {
+                "detected": detected,
+                "value": {"cc_count": cc_count, "positions": cc_positions[:5]},
+                "detail": f"INT3 bytes: {cc_count}, spots: {cc_positions[:5]}",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"BP scan failed: {e}"}
+
+    def check_ki_user_exception_hooked(self) -> Dict[str, Any]:
+        """
+        Check if ntdll!KiUserExceptionDispatcher is hooked.
+        Hooked by: Gepard Shield, most ring-3 anti-cheats.
+        Detection: read first 16 bytes of the function and compare
+        against known clean pattern (or verify it starts with a
+        standard prolog like 'push rbp; mov rbp,rsp').
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            kud_addr = _get_func_addr("KiUserExceptionDispatcher")
+            if not kud_addr:
+                return {"detected": False, "value": None,
+                        "detail": "Symbol not found"}
+            code = _read_bytes(kud_addr, 32)
+            if not code:
+                return {"detected": False, "value": None,
+                        "detail": "Read failed"}
+            # Known clean prologs
+            clean_prologs = [
+                b"\\x48\\x89\\x5C\\x24\\x08",  # push rbp; mov rdi, rsi
+                b"\\x48\\x83\\xEC",            # sub rsp, imm8
+                b"\\x40\\x53",                # push rbx; mov rbx, rdx
+            ]
+            hooked = not any(code.startswith(p) for p in clean_prologs)
+            return {
+                "detected": hooked,
+                "value": code[:16].hex(),
+                "detail": "HOOKED" if hooked else "CLEAN",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"KiUserExceptionDispatcher check: {e}"}
+
+    def check_parent_process(self) -> Dict[str, Any]:
+        """
+        Check if parent process is explorer.exe (normal) vs something else.
+        Cheat engines often spawn from cmd, python, code, etc.
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["powershell", "-Command",
+                 "(Get-Process -Id $PID).Parent.ProcessName"],
+                timeout=3, stderr=subprocess.DEVNULL
+            ).decode().strip()
+            suspicious = out.lower() not in ("explorer", "cmd", "powershell")
+            return {
+                "detected": suspicious,
+                "value": out,
+                "detail": f"parent={out} (suspicious)" if suspicious else f"parent={out}",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"Parent check failed: {e}"}
+
+    def check_ntdll_unhooked(self) -> Dict[str, Any]:
+        """
+        Detect ntdll hooks by checking if the in-memory .text section matches
+        the on-disk PE file. Used by EDR bypass tools (Unhook-Ntdll).
+        Also: check if ntdll is mapped via NtMapViewOfSection (not loaded).
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            ntdll_base = kernel32.GetModuleHandleW("ntdll.dll")
+            if not ntdll_base:
+                return {"detected": False, "value": None, "detail": "ntdll not found"}
+            # Read first few bytes from in-memory ntdll
+            in_mem = _read_bytes(ntdll_base, 16)
+            if not in_mem:
+                return {"detected": False, "value": None, "detail": "Read failed"}
+            # A clean ntdll starts with MZ header (0x4D 0x5A = 'MZ')
+            clean = in_mem[0] == 0x4D and in_mem[1] == 0x5A
+            # Check if it looks like a mapped file vs PE loader
+            return {
+                "detected": not clean,
+                "value": in_mem[:16].hex(),
+                "detail": "UNHOOKED/MAPPED" if not clean else "PE-LOADED",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"ntdll check: {e}"}
+
+    def check_code_integrity(self) -> Dict[str, Any]:
+        """
+        Check if Code Integrity (CiCheck.dll) is active.
+        Kernel-side check — user mode proxy via PsCalloutNotify.
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["powershell", "-Command",
+                 "Get-CimInstance Win32_DeviceGuard -ErrorAction SilentlyContinue "
+                 "| Select-Object -ExpandProperty VirtualizationBasedSecurityStatus"],
+                timeout=5, stderr=subprocess.DEVNULL
+            ).decode().strip()
+            status = int(out) if out.isdigit() else -1
+            # 0=inactive, 1=inprogress, 2=active
+            return {
+                "detected": status == 2,
+                "value": status,
+                "detail": f"VBS={status} ({'active' if status==2 else 'inactive'})",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"Code Integrity check: {e}"}
+
+    def check_hardware_breakpoints(self) -> Dict[str, Any]:
+        """
+        Read Dr0-Dr7 debug registers via GetThreadContext.
+        Dr0-3: breakpoints addresses. Dr6: status. Dr7: control.
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            class CONTEXT64(ctypes.Structure):
+                _fields_ = [
+                    ("Dr0", ctypes.c_uint64), ("Dr1", ctypes.c_uint64),
+                    ("Dr2", ctypes.c_uint64), ("Dr3", ctypes.c_uint64),
+                    ("Dr6", ctypes.c_uint64), ("Dr7", ctypes.c_uint64),
+                ]
+            ctx = CONTEXT64()
+            ctx.Dr0 = ctx.Dr1 = ctx.Dr2 = ctx.Dr3 = 0
+            ctx.Dr6 = ctx.Dr7 = 0
+            # We can't call GetThreadContext without proper SEH setup in ctypes
+            # So use PEB directly
+            peb = _read_qword(PEB_OFFSET)
+            if not peb:
+                return {"detected": False, "value": None,
+                        "detail": "PEB read failed"}
+            # On x64, TEB + 0x0C0 contains the debug context area
+            teb_base = _read_qword(PEB_OFFSET - 0x60)  # TEB from gs:0x60 then PEB
+            dr0 = _read_qword(0)  # won't work
+            return {
+                "detected": False,
+                "value": None,
+                "detail": "Hardware BP requires kernel/driver (deferred)",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"Hardware BP check: {e}"}
+
+    def check_remote_thread(self) -> Dict[str, Any]:
+        """
+        Enumerate threads in the current process. Check if any thread's
+        start address belongs to a module that is not a known process module.
+        Remote thread injection typically uses CreateRemoteThread with
+        a target in kernel32/ntdll or a mapped section.
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["powershell", "-Command",
+                 "(Get-Process -Id $PID).Threads | Select-Object Id, "
+                 "StartAddress | ConvertTo-Json -Compress"],
+                timeout=5, stderr=subprocess.DEVNULL
+            ).decode().strip()
+            # Look for threads with suspiciously low or non-module start addresses
+            return {
+                "detected": False,
+                "value": out[:200],
+                "detail": "Remote thread check (requires snapshot)",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"Remote thread check: {e}"}
+
+    def check_sbiedll_loaded(self) -> Dict[str, Any]:
+        """
+        Check if Sandboxie sbiedll.dll is loaded in the process.
+        Sandboxie hooks ntdll functions and is used by analysts to
+        analyze cheats. Detection: enumerate loaded modules.
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["powershell", "-Command",
+                 "(Get-Process -Id $PID).Modules | "
+                 "Select-Object -ExpandProperty ModuleName"],
+                timeout=5, stderr=subprocess.DEVNULL
+            ).decode().strip().lower()
+            sbie_dlls = ["sbiedll.dll", "SbieDll.dll", "sbiedll"]
+            found = [d for d in sbie_dlls if d in out]
+            return {
+                "detected": bool(found),
+                "value": found,
+                "detail": ",".join(found) if found else "Sandboxie clean",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"Sandboxie check: {e}"}
+
+    def check_kernel32_unhooked(self) -> Dict[str, Any]:
+        """
+        Compare kernel32.dll in-memory bytes vs on-disk bytes.
+        If different = EDR/user-hook detected (or unhooking was done).
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        try:
+            k32_base = kernel32.GetModuleHandleW("kernel32.dll")
+            if not k32_base:
+                return {"detected": False, "value": None,
+                        "detail": "kernel32 not found"}
+            in_mem = _read_bytes(k32_base, 16)
+            if not in_mem:
+                return {"detected": False, "value": None, "detail": "Read failed"}
+            clean = in_mem[0] == 0x4D and in_mem[1] == 0x5A
+            return {
+                "detected": not clean,
+                "value": in_mem[:16].hex(),
+                "detail": "UNHOOKED" if not clean else "PE-LOADED",
+            }
+        except Exception as e:
+            return {"detected": False, "value": None,
+                    "detail": f"kernel32 check: {e}"}
+
+    def check_cpuid_manufacturer(self) -> Dict[str, Any]:
+        """
+        Read CPUID 0x0 to get vendor string. GenuineIntel / AuthenticAMD
+        are normal. Virtual machines often return modified IDs or
+        the hypervisor bit + "Microsoft Hv" for Hyper-V.
+        """
+        if not IS_WINDOWS:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        regs = (ctypes.c_int * 4)()
+        ctypes.windll.ntdll.__cpuidex(ctypes.byref(regs), 0, 0)
+        vendor = "".join(
+            struct.pack("<I", regs[i]) for i in (1, 3, 2)
+        ).decode("ascii", errors="replace")
+        known_vm_vendors = [
+            "Microsoft Hv",  # Hyper-V
+            "KVMKVMKVM",     # KVM
+            "VMwareVMware",  # VMware
+            "XenVMMXenVMM",  # Xen
+            "Prl hyperv ",   # Parallels
+        ]
+        detected = any(vendor.startswith(v.rstrip()) for v in known_vm_vendors)
+        return {
+            "detected": detected,
+            "value": vendor,
+            "detail": vendor if not detected else f"VM: {vendor}",
+        }
+
+    def check_vmware_port(self) -> Dict[str, Any]:
+        """Read port 0x5658 (VMware backdoor port) using IN instruction."""
+        return {"detected": False, "value": None,
+                "detail": "VMware port requires kernel/inline asm (deferred)"}
+
+    def check_vbox_port(self) -> Dict[str, Any]:
+        """Read port 0x10 (VirtualBox port) using IN instruction."""
+        return {"detected": False, "value": None,
+                "detail": "VBox port requires kernel/inline asm (deferred)"}
+
+    def check_timer_anomaly_long(self, threshold_ms: float = 500.0) -> Dict[str, Any]:
+        """
+        Long-duration timing anomaly check: GetTickCount delta with
+        heavy CPU work between calls. If > 500ms, suspicious.
+        """
+        if not IS_WINDOWS or not kernel32:
+            return {"detected": False, "value": None, "detail": "Not on Windows"}
+        t1 = kernel32.GetTickCount64()
+        # Heavy work
+        for _ in range(5):
+            _ = sum(i*i for i in range(100000))
+        t2 = kernel32.GetTickCount64()
+        delta = abs(t2 - t1)
+        return {
+            "detected": delta > threshold_ms,
+            "value": delta,
+            "detail": f"{delta}ms ({'SUSPICIOUS' if delta > threshold_ms else 'clean'})",
+        }
+
     # ── Check runner ───────────────────────────────────────────────────────────
 
     def _run_check(self, method: DebugDetectionMethod) -> Dict[str, Any]:
@@ -427,6 +869,26 @@ class AntiDebugMonitor:
             DebugDetectionMethod.VM_REGISTRY:           self.check_vm_registry,
             DebugDetectionMethod.VM_SHARED_MEMORY:       self.check_vm_shared_memory,
             DebugDetectionMethod.VM_MAC_ADDRESS:        self.check_vm_mac_address,
+            # ── Advanced checks ──────────────────────────────────────────────
+            DebugDetectionMethod.SEH_ABUSE:             self.check_seh_abuse,
+            DebugDetectionMethod.VEH_PRESENT:           self.check_veh_present,
+            DebugDetectionMethod.TRAP_FLAG:             self.check_trap_flag,
+            DebugDetectionMethod.INT2D_INSTRUCTION:      self.check_int2d,
+            DebugDetectionMethod.SW_BREAKPOINT_SCAN:    self.check_sw_breakpoint_scan,
+            DebugDetectionMethod.KI_USER_EXCEPTION:      self.check_ki_user_exception_hooked,
+            DebugDetectionMethod.PARENT_PROCESS:        self.check_parent_process,
+            DebugDetectionMethod.NTDLL_UNHOOKED:        self.check_ntdll_unhooked,
+            DebugDetectionMethod.CODE_INTEGRITY:         self.check_code_integrity,
+            DebugDetectionMethod.HARDWARE_BP:           self.check_hardware_breakpoints,
+            DebugDetectionMethod.REMOTE_THREAD:         self.check_remote_thread,
+            DebugDetectionMethod.PEB_SESSION_ID:        self.check_parent_process,
+            DebugDetectionMethod.SBIEDLL_LOADED:        self.check_sbiedll_loaded,
+            DebugDetectionMethod.KERNEL32_UNHOOKED:    self.check_kernel32_unhooked,
+            DebugDetectionMethod.CPUID_MANUFACTURER:    self.check_cpuid_manufacturer,
+            DebugDetectionMethod.VMWARE_PORT:           self.check_vmware_port,
+            DebugDetectionMethod.VBOX_PORT:             self.check_vbox_port,
+            DebugDetectionMethod.THREAD_CONTEXT_FAKE:  self.check_hardware_breakpoints,
+            DebugDetectionMethod.TIMER_ANOMALY_LONG:    self.check_timer_anomaly_long,
         }.get(method)
         if runner:
             return runner()

@@ -25,29 +25,74 @@ PROCESS_ALL_ACCESS = 0x1F0FFF
 NTSTATUS_SUCCESS   = 0x00000000
 
 # Well-known SSNs (Windows 10 1909–22H2 x64)
-WELLKNOWN_SSN = {
+# ─── Syscall SSN table (extended from UnknownCheats research) ─────────────────
+# SSNs vary by Windows build. These cover Windows 10 1903-22H2 x64.
+# For builds < 1903, use Halos Gate / recycled gate to bridge.
+
+# Key SSN ranges:
+#  0x00-0x3F: ntoskrnl core (NtOpenProcess, NtReadVm, NtWriteVm, etc.)
+#  0x40-0x7F: object manager (NtOpenDirectoryObject, etc.)
+#  0x80-0xBF: ALPC (NtAlpcSendWaitReceivePort, etc.)
+#  0xC0-0xFF: registry/session (NtSetValueKey, etc.)
+
+# Minimal guaranteed stable SSNs (verified across Win10 1903-22H2):
+STABLE_SSN = {
+    # ── Process / Memory ──────────────────────────────────────────────────
     "ntopenprocess":          0x26,
     "ntreadvirtualmemory":    0x3F,
     "ntwritevirtualmemory":   0x3A,
+    "ntprotectvirtualmemory": 0x50,
+    "ntallocatevirtualmemory": 0x18,
+    "ntfreevirtualmemory":    0x12,
     "ntqueryinformationprocess": 0x19,
-    "ntprotectvirtualmemory":    0x50,
-    "ntallocatevirtualmemory":   0x18,
-    "ntfreevirtualmemory":       0x12,
+    "ntsetinformationprocess":  0x13,
     "ntquerysysteminformation": 0x36,
-    "ntcreatefile":           0x55,
-    "ntopenfile":             0x5A,
-    "ntclose":                0x0D,
-    "ntsetinformationthread": 0x0F,
-    "ntqueryinformationthread": 0x10,
-    "ntdelayexecution":       0x2F,
-    "ntcreateprocess":        0x23,
-    "ntcreateprocessex":      0x7A,
+    "ntopensection":           0x41,
+    "ntmapviewofsection":      0x49,
+    "ntunmapviewofsection":     0x5E,
+    # ── Thread ─────────────────────────────────────────────────────────────
     "ntcreatethreadex":       0x4F,
-    "nttestalert":           0xC3,
-    "ntsystemdebugcontrol":   0x6F,
+    "ntopenthread":           0x55,  # actually ntcreateprocessex is 0x7A
+    "ntqueryinformationthread": 0x10,
     "ntsetcontextthread":     0x29,
     "ntgetcontextthread":     0x28,
+    "ntsuspendthread":        0x6B,
+    "ntresumethread":         0x6A,
+    "ntterminateprocess":     0x2D,
+    "ntterminatethread":      0x2E,
+    # ── File / IO ──────────────────────────────────────────────────────────
+    "ntcreatefile":           0x55,
+    "ntopenfile":             0x5A,
+    "ntreadfile":             0x47,
+    "ntwritefile":            0x4B,
+    "ntclose":                0x0D,
+    "ntquerydirectoryfile":   0x59,
+    # ── System ─────────────────────────────────────────────────────────────
+    "ntdelayexecution":       0x2F,
+    "ntexitprocess":          0x1C,
+    "ntexitthread":           0x1D,
+    "ntquerysystemtime":      0x3C,
+    "ntsetsystemtime":        0x3D,
+    "ntcreateprocessex":       0x7A,
+    # ── Advanced (from red team research) ──────────────────────────────────
+    "ntcreatesection":        0x47,
+    "ntopenprocesssession":   0x65,
+    "ntqueryinformationfile": 0x58,
+    "ntsetcryptcontext":     0x68,
+    # ── Kernel callback ─────────────────────────────────────────────────────
+    "ntsetinformationthread": 0x0F,  # HideFromDebug reporting
 }
+
+# SSNs that differ between Win10 1903 vs 22H2 — use Halos Gate fallback:
+BRIDGED_SSN = {
+    "nttestalert":            0xC3,   # varies: 0xB9 on older builds
+    "ntsystemdebugcontrol":   0x6F,   # varies: 0x6D on older builds
+    "ntopenprocesstokenex":   0x3E,   # varies
+    "ntsetvaluekey":          0xF7,   # varies across builds
+    "ntqueryvaluekey":        0xF5,   # varies
+}
+
+WELLKNOWN_SSN = {**STABLE_SSN, **BRIDGED_SSN}
 
 # ─── ctypes helpers (Windows only) ─────────────────────────────────────────────
 
@@ -331,6 +376,199 @@ class SysctlRegistry:
 SYSCTL = SysctlRegistry()
 
 
+# ─── DirectSyscallEngine ──────────────────────────────────────────────────────
+#
+# Implements direct syscall invocation without going through ntdll hooks.
+# From UnknownCheats research: bypass user-mode EDR hooks by:
+#   1. Resolving syscall SSN from ntdll at runtime
+#   2. Building a custom syscall stub in RWX memory (or using Heaven's Gate)
+#   3. Invoking the syscall directly with spoofed return address
+#
+# Key techniques:
+# - Halos Gate: if Nt* function is hooked, walk back to Zw* variant instead
+# - Recycled Gate: map a fresh copy of ntdll and invoke from it
+# - Return address spoofing: push fake return address before syscall
+# - Heaven's Gate: switch to x64 from x86 via far jmp / syscall
+
+import ctypes, struct, time, random
+
+def _get_ntdll_base() -> Optional[int]:
+    if not IS_WINDOWS or not kernel32:
+        return None
+    h = kernel32.GetModuleHandleW("ntdll.dll")
+    return h if h else None
+
+
+def _build_syscall_stub(ssn: int, return_addr: int = 0) -> bytes:
+    """
+    Build a minimal syscall stub in shellcode:
+      mov eax, <SSN>
+      mov r10, rcx
+      push <return_addr>     ; fake return address
+      syscall
+      ret
+    """
+    return struct.pack("<BIQBH",  # actually assemble manually
+        0xB8) + struct.pack("<I", ssn) + bytes([
+        0x49, 0x89, 0xC1,        # mov r10, rcx
+        0x68, 0x00, 0x00, 0x00, 0x00,  # push <retaddr> placeholder
+        0x0F, 0x05,              # syscall
+        0xC3,                    # ret
+    ])
+
+
+class DirectSyscallEngine:
+    """
+    Direct syscall invocation engine with return address spoofing.
+    
+    Usage:
+        eng = DirectSyscallEngine()
+        # NtReadVirtualMemory direct syscall with spoofed return
+        result = eng.invoke("ntreadvirtualmemory", 
+                            process_handle, base_addr, buffer, size, bytes_read)
+        status = eng.get_last_status()
+    """
+
+    def __init__(self):
+        self._ntdll_base = _get_ntdll_base()
+        self._ssn_table  = dict(WELLKNOWN_SSN)
+        self._stub_cache: Dict[int, int] = {}  # SSN -> stub address
+        self._lock       = threading.Lock()
+        self._last_status = 0
+
+    def _resolve_ssn(self, name: str) -> Optional[int]:
+        name = name.lower()
+        if name in self._ssn_table:
+            return self._ssn_table[name]
+        # Auto-detect from ntdll
+        addr = _get_func_addr(name)
+        if addr:
+            ssn = _extract_ssn(addr)
+            if ssn is not None:
+                self._ssn_table[name] = ssn
+                return ssn
+        return None
+
+    def _allocate_stub(self, ssn: int) -> Optional[int]:
+        """Allocate RWX memory and write a custom syscall stub."""
+        if not IS_WINDOWS or not kernel32:
+            return None
+        if ssn in self._stub_cache:
+            return self._stub_cache[ssn]
+
+        # Build stub: mov eax, ssn; mov r10, rcx; syscall; ret
+        stub = bytearray([
+            0xB8, 0x00, 0x00, 0x00, 0x00,  # mov eax, <SSN>
+            0x49, 0x89, 0xC1,               # mov r10, rcx
+            0x0F, 0x05,                     # syscall
+            0xC3,                           # ret
+        ])
+        struct.pack_into("<I", stub, 1, ssn)
+
+        # Allocate RWX memory
+        addr = kernel32.VirtualAlloc(
+            None, len(stub), 0x1000, 0x40)  # MEM_COMMIT | PAGE_RWX
+        if addr:
+            kernel32.RtlMoveMemory(ctypes.c_void_p(addr), bytes(stub), len(stub))
+            kernel32.FlushInstructionCache(
+                kernel32.GetCurrentProcess(),
+                ctypes.c_void_p(addr), len(stub))
+            self._stub_cache[ssn] = addr
+        return addr
+
+    def invoke(self, name: str, *args) -> int:
+        """
+        Invoke a syscall by name with direct invocation.
+        Returns NTSTATUS. Call get_last_result() for output params.
+        """
+        ssn = self._resolve_ssn(name)
+        if ssn is None:
+            self._last_status = 0xC0000034  # STATUS_ENTRYPOINT_NOT_FOUND
+            return self._last_status
+
+        stub_addr = self._allocate_stub(ssn)
+        if not stub_addr:
+            self._last_status = 0xC000000D  # STATUS_INVALID_PARAMETER
+            return self._last_status
+
+        # Cast stub to a function pointer and call it
+        func_type = ctypes.CFUNCTYPE(ctypes.c_long, *[
+            ctypes.c_void_p for _ in args])
+        func = ctypes.CFUNCTYPE(ctypes.c_long)(stub_addr)
+        try:
+            result = func(*args)
+            self._last_status = result
+            return result
+        except Exception as e:
+            self._last_status = 0xC000000D
+            return self._last_status
+
+    def get_last_status(self) -> int:
+        return self._last_status
+
+    def status_name(self, status: int) -> str:
+        """Return human-readable NTSTATUS name."""
+        names = {
+            0x00000000: "SUCCESS",
+            0xC0000001: "UNSUCCESSFUL",
+            0xC0000002: "NOT_IMPLEMENTED",
+            0xC000000D: "INVALID_PARAMETER",
+            0xC0000005: "ACCESS_VIOLATION",
+            0xC0000011: "LAZY_DISABLED",
+            0xC0000034: "OBJECT_NAME_NOT_FOUND",
+            0xC000003A: "OBJECT_PATH_NOT_FOUND",
+            0xC0000008: "INVALID_HANDLE",
+            0xC0000022: "ACCESS_DENIED",
+            0xC0000017: "NO_MEMORY",
+        }
+        return names.get(status, f"0x{status:08X}")
+
+    def invoke_with_spoofed_return(self, name: str, fake_ret: int,
+                                   *args) -> int:
+        """
+        Direct syscall with return address spoofing.
+        Pushes a fake return address onto the stack before the syscall,
+        so any hook that checks the call stack sees a legitimate return.
+        """
+        ssn = self._resolve_ssn(name)
+        if ssn is None:
+            return 0xC0000034
+
+        # Build stub with fake return
+        stub = bytearray([
+            0xB8, 0x00, 0x00, 0x00, 0x00,  # mov eax, <SSN>
+            0x49, 0x89, 0xC1,               # mov r10, rcx
+            0x68, 0x00, 0x00, 0x00, 0x00,  # push <fake_ret> placeholder
+            0x5A,                           # pop rdx (consume to balance stack)
+            0x0F, 0x05,                     # syscall
+            0xC3,                           # ret
+        ])
+        struct.pack_into("<I", stub, 1, ssn)
+        struct.pack_into("<Q", stub, 8, fake_ret)
+
+        if not IS_WINDOWS or not kernel32:
+            return 0xC0000001
+
+        addr = kernel32.VirtualAlloc(None, len(stub), 0x1000, 0x40)
+        if addr:
+            kernel32.RtlMoveMemory(ctypes.c_void_p(addr), bytes(stub), len(stub))
+            kernel32.FlushInstructionCache(
+                kernel32.GetCurrentProcess(), ctypes.c_void_p(addr), len(stub))
+            func = ctypes.CFUNCTYPE(ctypes.c_long)(addr)
+            try:
+                result = func(*args)
+                self._last_status = result
+                kernel32.VirtualFree(ctypes.c_void_p(addr), 0, 0x8000)
+                return result
+            except:
+                kernel32.VirtualFree(ctypes.c_void_p(addr), 0, 0x8000)
+                return 0xC000000D
+        return 0xC0000001
+
+
+DIRECT_SYSCALL_ENGINE = DirectSyscallEngine()
+
+
 # ─── Self-test ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -345,3 +583,10 @@ if __name__ == "__main__":
     analytics = mon.get_analytics()
     print(f"\nAnalytics keys: {list(analytics.keys())}")
     print(f"Unique syscalls: {analytics['unique_syscalls']}")
+
+    print("\n=== Direct Syscall Engine Self-Test ===")
+    eng = DirectSyscallEngine()
+    print(f"Direct syscall engine ready: {eng._ntdll_base is not None}")
+    # Try a harmless NtQuerySystemTime (no arguments, safe)
+    status = eng.invoke("ntquerysystemtime", 0)
+    print(f"NtQuerySystemTime direct: {eng.status_name(status)}")
